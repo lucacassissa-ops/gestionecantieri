@@ -1,0 +1,1108 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SGC Pro - Sistema Gestione Cantieri</title>
+    
+    <!-- Core Libraries -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+
+    <style>
+        body { 
+            font-family: 'Calibri', 'Carlito', 'Roboto', sans-serif; 
+            background-color: #0f172a;
+            color: #f8fafc;
+            margin: 0;
+            overflow-x: hidden;
+        }
+        .avoid-break { page-break-inside: avoid !important; break-inside: avoid !important; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+        canvas { touch-action: none; }
+        input[type="date"], input[type="time"] { color-scheme: dark; }
+        .excel-input { background: transparent; border: none; width: 100%; height: 100%; padding: 8px; color: white; outline: none; }
+        .excel-input:focus { background: rgba(59, 130, 246, 0.1); }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fade-in { animation: fadeIn 0.4s ease-out forwards; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // ============================================================
+        // >>> CONFIGURAZIONE PASSWORD E DROPBOX <<<
+        // ============================================================
+        const APP_PASSWORD = "Cantieri2026!"; 
+        
+        // Per attivare l'invio su Dropbox, inserisci qui il tuo "Access Token" di Dropbox (generato da Dropbox App Console)
+        // Se lasci vuoto, il PDF verrà comunque salvato localmente e scaricato normalmente.
+        const DROPBOX_ACCESS_TOKEN_DEFAULT = ""; 
+        // ============================================================
+
+        const apiKey = ""; 
+        const GEMINI_MODEL = "gemini-2.5-flash-preview-09-2025";
+        
+        // --- ICONA PROFESSIONALE SVG SGC PRO ---
+        const sgcProLogoSvg = `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="100%" height="100%"><rect width="200" height="200" rx="40" fill="%230f172a"/><path d="M60 140V70l40-20 40 20v70z" fill="none" stroke="%233b82f6" stroke-width="12" stroke-linejoin="round"/><path d="M100 50v90" stroke="%233b82f6" stroke-width="8" stroke-dasharray="8 8"/><path d="M70 95h60M70 115h60" stroke="%23ef4444" stroke-width="8" stroke-linecap="round"/><circle cx="100" cy="30" r="14" fill="%23eab308"/></svg>`;
+        
+        const defaultLogo = sgcProLogoSvg;
+        const fallbackLogo = sgcProLogoSvg;
+
+        // --- SISTEMA ARCHIVIAZIONE INDEXEDDB (CAPURISSIMO) ---
+        const DB_NAME = "SGCPro_Database";
+        const DB_VERSION = 1;
+        const STORE_NAME = "cantieri";
+
+        const initDB = () => {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, DB_VERSION);
+                request.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        db.createObjectStore(STORE_NAME, { keyPath: "id" });
+                    }
+                };
+                request.onsuccess = (e) => resolve(e.target.result);
+                request.onerror = (e) => reject("Errore apertura IndexedDB");
+            });
+        };
+
+        const saveProjectsDB = async (projects) => {
+            const db = await initDB();
+            const tx = db.transaction(STORE_NAME, "readwrite");
+            const store = tx.objectStore(STORE_NAME);
+            store.clear();
+            projects.forEach(p => store.put(p));
+            return new Promise((resolve) => tx.oncomplete = () => resolve(true));
+        };
+
+        const loadProjectsDB = async () => {
+            const db = await initDB();
+            const tx = db.transaction(STORE_NAME, "readonly");
+            const store = tx.objectStore(STORE_NAME);
+            const request = store.getAll();
+            return new Promise((resolve) => request.onsuccess = () => resolve(request.result));
+        };
+
+        // --- INTEGRAZIONE DROPBOX CLOUD ---
+        const sanitizeFolderName = (name) => {
+            return (name || "Cantiere_Senza_Nome").replace(/[/\\?%*:|"<>]/g, '_').trim();
+        };
+
+        const uploadPDFToDropbox = async (token, projectName, reportNumber, reportDate, pdfBlob) => {
+            if (!token || !token.trim()) throw new Error("Token Dropbox non configurato.");
+            
+            const folderName = sanitizeFolderName(projectName);
+            const fileName = `Verbale_N_${reportNumber}_del_${reportDate || 'data'}.pdf`;
+            const dropboxPath = `/${folderName}/${fileName}`;
+
+            try {
+                await fetch('https://api.dropboxapi.com/2/files/create_folder_v2', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ path: `/${folderName}`, autorename: false })
+                });
+            } catch (e) { /* Cartella esistente */ }
+
+            const uploadResponse = await fetch('https://content.dropboxapi.com/2/files/upload', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/octet-stream',
+                    'Dropbox-API-Arg': JSON.stringify({
+                        path: dropboxPath,
+                        mode: 'add',
+                        autorename: true,
+                        mute: false
+                    })
+                },
+                body: pdfBlob
+            });
+
+            if (!uploadResponse.ok) {
+                const errData = await uploadResponse.text();
+                throw new Error(`Errore Dropbox Upload: ${errData}`);
+            }
+
+            const linkResponse = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ path: dropboxPath })
+            });
+
+            const linkData = await linkResponse.json();
+            if (linkData.error && linkData.error['.tag'] === 'shared_link_already_exists') {
+                const listResp = await fetch('https://api.dropboxapi.com/2/sharing/get_shared_links', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ path: dropboxPath })
+                });
+                const listData = await listResp.json();
+                return listData.links?.[0]?.url || "https://www.dropbox.com";
+            }
+
+            return linkData.url || "https://www.dropbox.com";
+        };
+
+        const callGemini = async (payload, retries = 5) => {
+            const delays = [1000, 2000, 4000, 8000, 16000];
+            const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+            for (let i = 0; i <= retries; i++) {
+                try {
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                    return await response.json();
+                } catch (err) {
+                    if (i === retries) throw err;
+                    await new Promise(res => setTimeout(res, delays[i]));
+                }
+            }
+        };
+
+        const formatDate = (dateStr) => {
+            if (!dateStr || typeof dateStr !== 'string') return "N.D.";
+            try { return dateStr.split('-').reverse().join('/'); } catch (e) { return "N.D."; }
+        };
+
+        const getProjectTiming = (proj) => {
+            if (!proj?.dateCantiere?.fine) return { remaining: 0, suspended: 0, adjustedDeadline: "" };
+            let suspendedDays = 0;
+            const sortedVerbali = [...(proj.verbali || [])].sort((a,b) => new Date(a.dataEmissione) - new Date(b.dataEmissione));
+            let lastSuspensionDate = null;
+            sortedVerbali.forEach(v => {
+                if (v.tipo === TIPI_VERBALE[1] || v.tipo === TIPI_VERBALE[3]) lastSuspensionDate = new Date(v.dataEmissione);
+                else if (v.tipo === TIPI_VERBALE[2] && lastSuspensionDate) {
+                    suspendedDays += Math.ceil((new Date(v.dataEmissione) - lastSuspensionDate) / 86400000);
+                    lastSuspensionDate = null;
+                }
+            });
+            const deadline = new Date(proj.dateCantiere.fine);
+            const adjustedDeadlineDate = new Date(deadline.getTime() + (suspendedDays * 86400000));
+            const diff = Math.ceil((adjustedDeadlineDate - new Date()) / 86400000);
+            return { remaining: diff, suspended: suspendedDays, adjustedDeadline: adjustedDeadlineDate.toISOString().split('T')[0] };
+        };
+
+        const compressImage = (base64Str) => {
+            return new Promise((resolve) => {
+                const img = new Image();
+                img.src = base64Str;
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    const MAX_WIDTH = 1024;
+                    let width = img.width, height = img.height;
+                    if (width > MAX_WIDTH) { height *= MAX_WIDTH / width; width = MAX_WIDTH; }
+                    canvas.width = width; canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, width, height);
+                    resolve(canvas.toDataURL('image/jpeg', 0.6));
+                };
+            });
+        };
+
+        const Icon = ({ name, size = 20, className = "" }) => {
+            const paths = {
+                plus: <path d="M12 5v14M5 12h14" />,
+                chevronRight: <path d="M9 18l6-6-9-6" />,
+                chevronDown: <path d="M6 9l6 6 6-6" />,
+                arrowLeft: <path d="M19 12H5M12 19l-7-7 7-7" />,
+                mapPin: <><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z" /><circle cx="12" cy="10" r="3" /></>,
+                camera: <><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z" /><circle cx="12" cy="13" r="4" /></>,
+                penTool: <path d="M12 19l7-7 3 3-7 7-3-3z M18 13l-1.5-7.5L2 2l3.5 14.5L13 18l5-5z" />,
+                fileText: <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z M14 2v6h6 M16 13H8 M16 17H8" />,
+                trash2: <><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" /><line x1="10" y1="11" x2="10" y2="17" /><line x1="14" y1="11" x2="14" y2="17" /></>,
+                download: <><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></>,
+                folderOpen: <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />,
+                upload: <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4 M17 8l-5-5-5 5 M12 3v12" />,
+                save: <path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z M17 21v-8H7v8 M7 3v5h8" />,
+                alertTriangle: <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z M12 9v4 M12 17h.01" />,
+                sparkles: <path d="M12 3l1.91 5.89L20 10.8l-5.89 1.91L12 18.6l-1.91-5.89L4 10.8l5.89-1.91L12 3z" />,
+                x: <path d="M18 6L6 18M6 6l12 12" />,
+                lock: <><rect x="3" y="11" width="18" height="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0110 0v4" /></>,
+                users: <><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2" /><circle cx="9" cy="7" r="4" /></>,
+                logOut: <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4 M16 17l5-5-5-5 M21 12H9" />,
+                calendar: <><rect x="3" y="4" width="18" height="18" rx="2" ry="2" /><line x1="16" y1="2" x2="16" y2="6" /><line x1="8" y1="2" x2="8" y2="6" /><line x1="3" y1="10" x2="21" y2="10" /></>,
+                table: <><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></>,
+                search: <><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></>,
+                fileCheck: <><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" /><polyline points="14 2 14 8 20 8" /><path d="M9 15l2 2 4-4" /></>,
+                fileUp: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/></>,
+                cloud: <><path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/></>
+            };
+            return (
+                <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+                    {paths[name] || <circle cx="12" cy="12" r="10" />}
+                </svg>
+            );
+        };
+
+        const TIPI_VERBALE = ["Sopralluogo Tecnico", "Verbale di Sospensione Lavori", "Verbale di Ripresa Lavori", "Verbale di Sospensione Parziale", "Verbale di Consegna Lavori", "Verbale di Ultimazione Lavori"];
+        const RUOLI_INTERVENUTI = ["Direttore dei Lavori (DL)", "Coordinatore Sicurezza (CSE)", "Direttore Operativo (DO)", "Impresa Affidataria", "Impresa Subappaltatrice", "Impresa Subaffidataria", "Committente", "Altro"];
+        const CATEGORIE_ANTINCENDIO = ["Porte REI", "Serramenti", "Contropareti", "Cartongessi", "Idranti", "Estintori", "Rilevazione Fumi", "Evacuatori Fumo/Calore", "Segnaletica", "Altro"];
+        
+        const STATI_COMMESSA_LIST = {
+            attiva: { label: 'Attiva', color: 'bg-green-500', hex: '#22c55e', text: 'text-green-400', bgLight: 'bg-green-500/20', border: 'border-green-500/30' },
+            sospesa: { label: 'Sospesa', color: 'bg-orange-500', hex: '#f97316', text: 'text-orange-400', bgLight: 'bg-orange-500/20', border: 'border-orange-500/30' },
+            conclusa: { label: 'Conclusa', color: 'bg-purple-500', hex: '#a855f7', text: 'text-purple-400', bgLight: 'bg-purple-500/20', border: 'border-purple-500/30' }
+        };
+
+        function SignaturePad({ onSave, onCancel }) {
+            const canvasRef = useRef(null);
+            const [isDrawing, setIsDrawing] = useState(false);
+            useEffect(() => {
+                const canvas = canvasRef.current;
+                canvas.width = canvas.parentElement.getBoundingClientRect().width;
+                canvas.height = 350;
+                const ctx = canvas.getContext('2d');
+                ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.strokeStyle = '#000';
+            }, []);
+            const getXY = (e) => {
+                const rect = canvasRef.current.getBoundingClientRect();
+                const x = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+                const y = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
+                return [x, y];
+            };
+            return (
+                <div className="w-full text-black">
+                    <div className="bg-white rounded-[2rem] p-4 border-8 border-slate-700 shadow-inner overflow-hidden">
+                        <canvas ref={canvasRef} onPointerDown={(e)=>{e.preventDefault(); const [x,y]=getXY(e); canvasRef.current.getContext('2d').beginPath(); canvasRef.current.getContext('2d').moveTo(x,y); setIsDrawing(true);}} onPointerMove={(e)=>{if(!isDrawing)return; e.preventDefault(); const [x,y]=getXY(e); canvasRef.current.getContext('2d').lineTo(x,y); canvasRef.current.getContext('2d').stroke();}} onPointerUp={()=>setIsDrawing(false)} className="w-full bg-white cursor-crosshair touch-none h-[350px]" />
+                    </div>
+                    <div className="flex justify-between mt-10 gap-6 uppercase text-[10px] font-black tracking-widest">
+                        <button onClick={onCancel} className="bg-slate-700 text-white px-8 py-4 rounded-2xl flex-1 transition-all active:scale-95 shadow-md">Annulla</button>
+                        <button onClick={()=>{canvasRef.current.getContext('2d').clearRect(0,0,canvasRef.current.width,canvasRef.current.height);}} className="bg-slate-700 text-white px-8 py-4 rounded-2xl flex-1 transition-all active:scale-95 shadow-md">Pulisci</button>
+                        <button onClick={()=>onSave(canvasRef.current.toDataURL())} className="bg-blue-600 text-white px-8 py-4 rounded-2xl flex-1 shadow-2xl active:scale-95 transition-all">Conferma</button>
+                    </div>
+                </div>
+            );
+        }
+
+        function App() {
+            const [isAuthenticated, setIsAuthenticated] = useState(false);
+            const [passwordInput, setPasswordInput] = useState('');
+            const [loginError, setLoginError] = useState(false);
+            const [view, setView] = useState('dashboard');
+            const [projects, setProjects] = useState([]);
+            const [currentProject, setCurrentProject] = useState(null);
+            const [currentReport, setCurrentReport] = useState(null);
+            const [customLogo, setCustomLogo] = useState(null);
+            const [saveMessage, setSaveMessage] = useState('');
+            const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
+            const [signingId, setSigningId] = useState(null);
+            const [archiveSearch, setArchiveSearch] = useState('');
+            const [expandedFolder, setExpandedFolder] = useState(null);
+            const [showAI, setShowAI] = useState(false);
+            const [aiLoading, setAiLoading] = useState(false);
+            const [aiResult, setAiResult] = useState('');
+            
+            const [dropboxToken, setDropboxToken] = useState(localStorage.getItem('sgc_dropbox_token') || DROPBOX_ACCESS_TOKEN_DEFAULT);
+            const [showSettings, setShowSettings] = useState(false);
+            const [projectToDelete, setProjectToDelete] = useState(null);
+
+            useEffect(() => {
+                const triggerInizializzazione = async () => {
+                    let datiCaricati = [];
+                    const vecchioLocalStorage = localStorage.getItem('sgc_pro_v_final_verified_stable') || localStorage.getItem('sgc_pro_v_final_ai_stable_v2');
+                    if (vecchioLocalStorage) {
+                        datiCaricati = JSON.parse(vecchioLocalStorage);
+                        await saveProjectsDB(datiCaricati);
+                        localStorage.removeItem('sgc_pro_v_final_verified_stable');
+                        localStorage.removeItem('sgc_pro_v_final_ai_stable_v2');
+                    } else {
+                        datiCaricati = await loadProjectsDB();
+                    }
+                    setProjects(datiCaricati || []);
+                    
+                    const logo = localStorage.getItem('sgc_logo_vfinal');
+                    if (logo) setCustomLogo(logo);
+                    if (sessionStorage.getItem('sgc_auth') === 'true') setIsAuthenticated(true);
+                };
+                triggerInizializzazione();
+            }, []);
+
+            const syncWithDatabase = async (updatedList) => {
+                setProjects(updatedList);
+                await saveProjectsDB(updatedList);
+            };
+
+            const handleLogin = (e) => {
+                e.preventDefault();
+                if (passwordInput === APP_PASSWORD) {
+                    setIsAuthenticated(true);
+                    sessionStorage.setItem('sgc_auth', 'true');
+                } else {
+                    setLoginError(true);
+                    setPasswordInput('');
+                }
+            };
+
+            const handleLogout = () => { setIsAuthenticated(false); sessionStorage.removeItem('sgc_auth'); };
+            const handleImageError = (e) => { e.target.onerror = null; e.target.src = fallbackLogo; };
+
+            const updateCurrentProject = (data) => {
+                const updated = { ...currentProject, ...data };
+                setCurrentProject(updated);
+                const updatedList = projects.map(p => p.id === updated.id ? updated : p);
+                syncWithDatabase(updatedList);
+            };
+
+            const handleCreateProject = () => {
+                const newP = {
+                    id: Math.random().toString(36).substr(2, 9),
+                    nomeLavoro: 'Nuovo Progetto Adeguamento', stato: 'attiva',
+                    fotoCopertina: null, dateCantiere: { consegna: '', fine: '' },
+                    ruoli: { dl: '', cse: '', do: '' }, impresaAppaltatrice: { nome: '', operai: '' },
+                    impreseSub: [], note: { dl: '', cse: '' }, verbali: [], posizione: { lat: '', lng: '', indirizzo: '' },
+                    cronoprogramma: []
+                };
+                const updatedList = [newP, ...projects];
+                setCurrentProject(newP);
+                syncWithDatabase(updatedList);
+                setView('project');
+            };
+
+            const handleDeleteProject = (projId) => {
+                const updatedList = projects.filter(p => p.id !== projId);
+                syncWithDatabase(updatedList);
+                setProjectToDelete(null);
+            };
+
+            // --- FUNZIONE GPS CORRETTA E ROBUSTA ---
+            const getLocation = () => {
+                if (!navigator.geolocation) {
+                    setSaveMessage("GPS non supportato dal browser");
+                    setTimeout(() => setSaveMessage(''), 3000);
+                    return;
+                }
+                setSaveMessage("Acquisizione coordinate GPS in corso...");
+                navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                        const lat = pos.coords.latitude.toFixed(6);
+                        const lng = pos.coords.longitude.toFixed(6);
+                        updateCurrentProject({ 
+                            posizione: { 
+                                ...currentProject.posizione, 
+                                lat: lat, 
+                                lng: lng, 
+                                indirizzo: currentProject.posizione?.indirizzo || `Lat: ${lat}, Lng: ${lng}` 
+                            } 
+                        });
+                        setSaveMessage("✅ GPS Acquisito con successo!");
+                        setTimeout(() => setSaveMessage(''), 3000);
+                    },
+                    (error) => {
+                        let errorMsg = "Errore GPS sconosciuto";
+                        switch(error.code) {
+                            case error.PERMISSION_DENIED:
+                                errorMsg = "Permesso GPS negato. Autorizza la geolocalizzazione.";
+                                break;
+                            case error.POSITION_UNAVAILABLE:
+                                errorMsg = "Informazioni GPS non disponibili.";
+                                break;
+                            case error.TIMEOUT:
+                                errorMsg = "Tempo esaurito per la ricerca GPS.";
+                                break;
+                        }
+                        setSaveMessage(`⚠️ ${errorMsg}`);
+                        setTimeout(() => setSaveMessage(''), 4000);
+                    },
+                    { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+                );
+            };
+
+            const handleFileImport = async (e) => {
+                const file = e.target.files[0];
+                if (!file || !currentProject) return;
+                setAiLoading(true); setShowAI(true); setAiResult("Analisi documento e normalizzazione date in corso...");
+
+                const reader = new FileReader();
+                reader.onload = async (evt) => {
+                    try {
+                        let payload = { contents: [{ parts: [] }] };
+                        const sysPrompt = "Sei un ingegnere civile. Estrai cronoprogramma lavori in JSON. Normalizza TUTTE le date nel formato ISO YYYY-MM-DD. Restituisci ESCLUSIVAMENTE un oggetto JSON con chiave 'cronoprogramma' (array di oggetti con 'lavorazione', 'inizio', 'fine').";
+                        
+                        if (file.name.match(/\.(xlsx|xls|csv)$/)) {
+                            const wb = XLSX.read(evt.target.result, { type: 'binary' });
+                            const content = XLSX.utils.sheet_to_csv(wb.Sheets[wb.SheetNames[0]]);
+                            payload.contents[0].parts.push({ text: `Analizza questo CSV ed estrai il cronoprogramma: ${content}` });
+                        } else {
+                            const base64Data = evt.target.result.split(',')[1];
+                            payload.contents[0].parts.push({ text: "Analizza visivamente questo documento ed estrai la tabella del cronoprogramma lavori." });
+                            payload.contents[0].parts.push({ inlineData: { mimeType: file.type, data: base64Data } });
+                        }
+
+                        const data = await callGemini({
+                            systemInstruction: { parts: [{ text: sysPrompt }] },
+                            contents: payload.contents,
+                            generationConfig: { 
+                                responseMimeType: "application/json",
+                                responseSchema: {
+                                    type: "OBJECT",
+                                    properties: {
+                                        cronoprogramma: {
+                                            type: "ARRAY",
+                                            items: {
+                                                type: "OBJECT",
+                                                properties: { lavorazione: { type: "STRING" }, inizio: { type: "STRING" }, fine: { type: "STRING" } },
+                                                required: ["lavorazione", "inizio", "fine"]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+
+                        const cleanJson = data.candidates[0].content.parts[0].text.replace(/```json/g, "").replace(/```/g, "").trim();
+                        const result = JSON.parse(cleanJson);
+                        updateCurrentProject({ cronoprogramma: result.cronoprogramma });
+                        setAiResult("✅ Il cronoprogramma è stato importato con successo!");
+                    } catch (err) { 
+                        setAiResult("❌ Errore durante l'analisi. Verifica che le date siano leggibili."); 
+                    } finally { setAiLoading(false); }
+                };
+
+                if (file.name.match(/\.(xlsx|xls|csv)$/)) reader.readAsBinaryString(file);
+                else reader.readAsDataURL(file);
+            };
+
+            const handleAnalyzeAI = async () => {
+                if (!currentProject) return;
+                setShowAI(true); setAiLoading(true); setAiResult("");
+                const today = currentReport?.dataEmissione || new Date().toISOString().split('T')[0];
+                const task = (currentProject.cronoprogramma || []).find(t => today >= t.inizio && today <= t.fine);
+                const prompt = `Agisci come un esperto Direttore dei Lavori. Cantiere: ${currentProject.nomeLavoro}. Cronoprogramma: ${JSON.stringify(currentProject.cronoprogramma)}. Previsto oggi: ${task?.lavorazione || 'Nessuna specifica'}. Reale: ${currentReport?.lavorazioneEffettiva}. Suggerisci ricalibrazione piano in italiano professionale.`;
+                
+                try {
+                    const data = await callGemini({ contents: [{ parts: [{ text: prompt }] }] });
+                    setAiResult(data.candidates[0].content.parts[0].text);
+                } catch (e) { setAiResult("IA non raggiungibile."); } finally { setAiLoading(false); }
+            };
+
+            const generatePDFAndSaveCloud = async () => {
+                setIsGeneratingPDF(true); window.scrollTo(0, 0);
+                setTimeout(() => {
+                    const element = document.getElementById('pdf-content');
+                    const opt = {
+                        margin: [10, 0, 30, 0], 
+                        filename: `Verbale_N_${currentReport?.numero}_del_${currentReport?.dataEmissione}.pdf`,
+                        image: { type: 'jpeg', quality: 1 }, 
+                        html2canvas: { scale: 3.1, useCORS: true, x: 0, y: 0, windowWidth: 800, width: 800 },
+                        jsPDF: { unit: 'mm', format: 'a3', orientation: 'portrait' }
+                    };
+                    
+                    html2pdf().set(opt).from(element).toPdf().get('pdf').then((pdf) => {
+                        const totalPages = pdf.internal.getNumberOfPages();
+                        for (let i = 1; i <= totalPages; i++) {
+                            pdf.setPage(i); 
+                            const pageWidth = pdf.internal.pageSize.getWidth(); 
+                            const pageHeight = pdf.internal.pageSize.getHeight();
+                            pdf.setFontSize(7); pdf.setTextColor(100, 100, 100); pdf.setDrawColor(200, 200, 200); 
+                            pdf.line(15, pageHeight - 20, pageWidth - 15, pageHeight - 20);
+                            pdf.text("Città Metropolitana di Genova - CF: 80007350103 | P.Iva: 00949170104 | Piazzale Mazzini 2, 16122 Genova", pageWidth / 2, pageHeight - 16, { align: 'center' });
+                            pdf.text(`P.E.C.: pec@cert.cittametropolitana.genova.it | Centralino 010 54991 | Pagina ${i} di ${totalPages}`, pageWidth / 2, pageHeight - 12, { align: 'center' });
+                        }
+                    }).output('blob').then(async (pdfBlob) => {
+                        if (dropboxToken && dropboxToken.trim().length > 5) {
+                            try {
+                                setSaveMessage("Salvataggio in corso su Dropbox...");
+                                await uploadPDFToDropbox(
+                                    dropboxToken, 
+                                    currentProject.nomeLavoro, 
+                                    currentReport.numero, 
+                                    currentReport.dataEmissione, 
+                                    pdfBlob
+                                );
+                                setSaveMessage("✅ Caricato su Dropbox con successo!");
+                                setTimeout(() => setSaveMessage(''), 3000);
+                            } catch (cloudErr) {
+                                console.error(cloudErr);
+                                setSaveMessage("⚠️ PDF salvato offline (Errore cloud Dropbox)");
+                                setTimeout(() => setSaveMessage(''), 3000);
+                            }
+                        }
+
+                        const url = URL.createObjectURL(pdfBlob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `Verbale_N_${currentReport?.numero}_del_${currentReport?.dataEmissione}.pdf`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                        
+                        setIsGeneratingPDF(false);
+                    }).catch(err => {
+                        console.error("PDF generation error:", err);
+                        setIsGeneratingPDF(false);
+                    });
+                }, 1000);
+            };
+
+            if (!isAuthenticated) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center p-6 bg-slate-950 animate-fade-in text-white text-center">
+                        <div className="w-full max-w-md bg-slate-900 p-10 rounded-[3rem] border border-slate-800 shadow-2xl">
+                            <div className="w-24 h-24 bg-white rounded-3xl p-3 mx-auto mb-8 shadow-xl flex items-center justify-center overflow-hidden">
+                                <img src={defaultLogo} className="w-full h-full object-contain" />
+                            </div>
+                            <h1 className="text-3xl font-black uppercase mb-2">SGC Pro</h1>
+                            <p className="text-xs font-bold text-slate-500 uppercase mb-10 tracking-widest">Sistema Gestione Cantieri</p>
+                            <form onSubmit={handleLogin} className="space-y-6">
+                                <input type="password" placeholder="Password Accesso" value={passwordInput} onChange={(e) => setPasswordInput(e.target.value)} className="w-full bg-slate-800 border-2 border-slate-700 text-white p-5 rounded-2xl outline-none focus:border-blue-500 text-center font-bold shadow-inner" />
+                                {loginError && <p className="text-red-400 text-xs font-bold">Password errata.</p>}
+                                <button type="submit" className="w-full bg-blue-600 py-5 rounded-2xl font-black uppercase shadow-xl hover:bg-blue-500 active:scale-95 transition-all">Sblocca</button>
+                            </form>
+                        </div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="min-h-screen pb-10 text-white bg-slate-900">
+                    {/* DASHBOARD */}
+                    {view === 'dashboard' && (
+                        <div className="p-6 max-w-5xl mx-auto animate-fade-in">
+                            <div className="flex flex-col md:flex-row justify-between items-center mb-12 gap-8 text-white">
+                                <div className="flex items-center gap-6">
+                                    <div className="w-24 h-24 bg-white rounded-3xl p-2 border border-slate-700 relative group shadow-2xl overflow-hidden flex items-center justify-center">
+                                        <img src={customLogo || defaultLogo} className="w-full h-full object-contain" onError={handleImageError} />
+                                        <input type="file" className="absolute inset-0 opacity-0 cursor-pointer" onChange={(e) => { const r = new FileReader(); r.onload = () => { setCustomLogo(r.result); localStorage.setItem('sgc_logo_vfinal', r.result); }; r.readAsDataURL(e.target.files[0]); }} />
+                                        <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center pointer-events-none transition-all"><Icon name="camera"/></div>
+                                    </div>
+                                    <div>
+                                        <h1 className="text-4xl font-black uppercase tracking-tighter">SGC Pro</h1>
+                                        <div className="flex items-center gap-4 mt-2 text-white">
+                                            <p className="text-[10px] font-bold text-slate-500 uppercase">Città Metropolitana di Genova</p>
+                                            <button onClick={() => setShowSettings(true)} className="bg-slate-800 hover:bg-slate-700 text-indigo-400 px-3 py-1 rounded-lg text-[9px] font-black uppercase border border-indigo-500/30 flex items-center gap-1"><Icon name="cloud" size={12}/> Cloud Dropbox</button>
+                                            <button onClick={handleLogout} className="bg-red-500/10 text-red-400 px-3 py-1 rounded-lg text-[9px] font-black uppercase border border-red-500/20"><Icon name="logOut" size={10} className="inline mr-1"/> Esci</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="flex gap-4">
+                                    <button onClick={() => setView('archive')} className="bg-slate-800 px-6 py-4 rounded-2xl font-bold border border-slate-700 shadow-xl"><Icon name="folderOpen" className="text-amber-500 inline mr-2"/> Archivio</button>
+                                    <button onClick={handleCreateProject} className="bg-blue-600 px-8 py-4 rounded-2xl font-bold shadow-xl active:scale-95 text-sm uppercase">+ Nuovo Cantiere</button>
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                                {projects.map(p => (
+                                    <div key={p.id} onClick={() => { setCurrentProject(p); setView('project'); }} className="bg-slate-800 rounded-[2.5rem] border border-slate-700 overflow-hidden cursor-pointer hover:border-blue-500 transition-all shadow-xl group flex flex-col h-full relative">
+                                        <div className={`absolute top-0 left-0 w-2 h-full ${STATI_COMMESSA_LIST[p.stato || 'attiva']?.color} z-20`}></div>
+                                        
+                                        <button onClick={(e) => { e.stopPropagation(); setProjectToDelete(p); }} className="absolute bottom-4 right-4 z-30 bg-red-600/85 hover:bg-red-600 text-white p-2.5 rounded-xl shadow-lg transition-all"><Icon name="trash2" size={16}/></button>
+
+                                        <div className="h-44 bg-slate-900 relative overflow-hidden">{p.fotoCopertina ? <img src={p.fotoCopertina} className="w-full h-full object-cover opacity-60 group-hover:scale-110 transition-all duration-700" /> : <div className="w-full h-full flex items-center justify-center opacity-10"><Icon name="camera" size={40} /></div>}<div className="absolute top-4 right-4 px-3 py-1 rounded-xl text-[9px] font-black uppercase bg-slate-900/80 border border-white/10 backdrop-blur-md">{STATI_COMMESSA_LIST[p.stato || 'attiva']?.label}</div></div>
+                                        <div className="p-7 text-white"><h3 className="font-bold text-lg uppercase truncate mb-1">{p.nomeLavoro}</h3><p className="text-xs text-slate-500 truncate italic">{(p.verbali || []).length} Documenti presenti</p></div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* MODAL CONFIGURAZIONE DROPBOX */}
+                    {showSettings && (
+                        <div className="fixed inset-0 bg-black/90 z-[300] flex items-center justify-center p-4 backdrop-blur-sm animate-fade-in text-white">
+                            <div className="bg-slate-800 p-8 rounded-[2.5rem] border border-slate-700 shadow-2xl max-w-lg w-full">
+                                <div className="flex justify-between items-center mb-6">
+                                    <h3 className="text-xl font-black uppercase flex items-center gap-2"><Icon name="cloud" className="text-indigo-400"/> Integrazione Cloud Dropbox</h3>
+                                    <button onClick={() => setShowSettings(false)} className="text-slate-400 hover:text-white"><Icon name="x" size={24}/></button>
+                                </div>
+                                <p className="text-xs text-slate-300 mb-4">Inserendo il tuo <strong className="text-white">Dropbox Access Token</strong>, ogni volta che generi un verbale l'app creerà automaticamente una cartella con il nome esatto della commessa e vi caricherà dentro il file PDF numerato e datato.</p>
+                                <div className="space-y-4">
+                                    <input type="text" placeholder="Incolla Dropbox Access Token..." value={dropboxToken} onChange={(e) => { setDropboxToken(e.target.value); localStorage.setItem('sgc_dropbox_token', e.target.value); }} className="w-full bg-slate-900 p-4 rounded-2xl border border-slate-700 text-xs font-mono text-white outline-none focus:border-indigo-500" />
+                                    <button onClick={() => setShowSettings(false)} className="w-full bg-indigo-600 py-4 rounded-2xl font-black uppercase text-xs tracking-widest shadow-lg">Salva e Chiudi</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* MODAL CONFERMA ELIMINAZIONE CANTIERE */}
+                    {projectToDelete && (
+                        <div className="fixed inset-0 bg-black/90 z-[250] flex items-center justify-center p-4 backdrop-blur-sm animate-fade-in text-white">
+                            <div className="bg-slate-800 p-8 rounded-[2.5rem] border border-slate-700 shadow-2xl max-w-md w-full text-center">
+                                <Icon name="alertTriangle" size={48} className="text-red-500 mx-auto mb-4" />
+                                <h3 className="text-xl font-black uppercase mb-2">Elimina Cantiere</h3>
+                                <p className="text-xs text-slate-400 mb-6 uppercase">Stai per eliminare definitivamente il cantiere <strong className="text-white">{projectToDelete.nomeLavoro}</strong> e tutti i suoi verbali. L'operazione è irreversibile.</p>
+                                <div className="flex gap-4">
+                                    <button onClick={() => setProjectToDelete(null)} className="flex-1 bg-slate-700 py-3 rounded-2xl font-bold uppercase text-xs">Annulla</button>
+                                    <button onClick={() => handleDeleteProject(projectToDelete.id)} className="flex-1 bg-red-600 py-3 rounded-2xl font-bold uppercase text-xs shadow-lg">Elimina</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* VISTA ARCHIVIO */}
+                    {view === 'archive' && (
+                        <div className="p-6 max-w-5xl mx-auto min-h-screen text-white animate-fade-in">
+                            <div className="flex items-center gap-4 mb-8">
+                                <button onClick={() => setView('dashboard')} className="p-4 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-2xl shadow-lg transition-all"><Icon name="arrowLeft" size={24}/></button>
+                                <h2 className="text-3xl font-black text-white uppercase">Archivio Documentale</h2>
+                            </div>
+                            <div className="relative mb-8">
+                                <Icon name="search" className="absolute left-5 top-1/2 -translate-y-1/2 text-slate-500" size={20} />
+                                <input type="text" placeholder="Cerca cantiere..." value={archiveSearch} onChange={(e) => setArchiveSearch(e.target.value)} className="w-full bg-slate-800 border-slate-700 text-white pl-14 pr-6 py-5 rounded-2xl outline-none font-bold shadow-inner" />
+                            </div>
+                            <div className="space-y-6">
+                                {projects.filter(p => p.nomeLavoro.toLowerCase().includes(archiveSearch.toLowerCase())).map(p => (
+                                    <div key={p.id} className="bg-slate-800 rounded-3xl border border-slate-700 overflow-hidden shadow-2xl">
+                                        <div onClick={() => setExpandedFolder(expandedFolder === p.id ? null : p.id)} className="p-6 flex items-center justify-between cursor-pointer hover:bg-slate-700 transition-colors">
+                                            <div className="flex items-center gap-5">
+                                                <Icon name="folderOpen" size={32} className="text-amber-500" />
+                                                <div><h3 className="font-bold text-white text-md uppercase tracking-wide">{p.nomeLavoro}</h3><p className="text-[10px] text-slate-500 font-black uppercase tracking-widest mt-1">{(p.verbali || []).length} verbali emessi</p></div>
+                                            </div>
+                                            <Icon name="chevronDown" className={`text-slate-500 transition-transform ${expandedFolder === p.id ? 'rotate-180' : ''}`} />
+                                        </div>
+                                        {expandedFolder === p.id && (
+                                            <div className="bg-slate-900/50 px-6 pb-6 pt-2 border-t border-slate-700/50 space-y-2">
+                                                {(p.verbali || []).map((v) => (
+                                                    <div key={v.id} className="flex items-center justify-between p-4 border-b border-slate-800 last:border-none group hover:bg-slate-800/50 rounded-xl transition-all">
+                                                        <div className="flex items-center gap-4 text-white"><Icon name="fileCheck" className="text-blue-500" /><p className="text-xs font-black text-slate-200 uppercase tracking-widest">Verbale N° {v.numero} del {formatDate(v.dataEmissione)}</p></div>
+                                                        <button onClick={() => { setCurrentProject(p); setCurrentReport(v); generatePDFAndSaveCloud(); }} className="text-blue-400 hover:bg-blue-500/10 p-2 rounded-lg transition-colors text-white"><Icon name="download" /></button>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {/* SCHEDA PROGETTO */}
+                    {view === 'project' && currentProject && (
+                        <div className="p-4 max-w-6xl mx-auto pb-24 animate-fade-in text-white">
+                            <div className="flex flex-col md:flex-row md:items-center gap-6 mb-10">
+                                <button onClick={() => setView('dashboard')} className="bg-slate-800 p-4 rounded-2xl shadow-xl hover:bg-slate-700 transition-all text-white"><Icon name="arrowLeft" /></button>
+                                <div className="flex-1">
+                                    <input type="text" value={currentProject.nomeLavoro} onChange={(e) => updateCurrentProject({nomeLavoro: e.target.value})} className="bg-transparent border-none text-3xl font-black uppercase w-full focus:ring-0 p-0 tracking-tighter text-white" />
+                                    <p className="text-[10px] font-bold text-slate-500 uppercase mt-1">Scheda Cantiere - Città Metropolitana</p>
+                                </div>
+                                <div className="flex gap-4 items-center">
+                                    <select value={currentProject.stato || 'attiva'} onChange={(e) => updateCurrentProject({stato: e.target.value})} className={`rounded-2xl font-black border-none px-6 py-4 text-[10px] uppercase shadow-xl ${STATI_COMMESSA_LIST[currentProject.stato || 'attiva']?.bgLight} ${STATI_COMMESSA_LIST[currentProject.stato || 'attiva']?.text} border ${STATI_COMMESSA_LIST[currentProject.stato || 'attiva']?.border} outline-none focus:ring-0 text-white`}>
+                                        <option value="attiva">Attiva</option><option value="sospesa">Sospesa</option><option value="conclusa">Conclusa</option>
+                                    </select>
+                                    <button onClick={() => { setSaveMessage('Salvato in DB'); setTimeout(()=>setSaveMessage(''), 2000); }} className="bg-green-600 px-8 py-4 rounded-2xl font-bold shadow-xl active:scale-95 transition-all text-xs uppercase flex items-center gap-2 text-white"><Icon name="save" size={18}/> Salva</button>
+                                </div>
+                            </div>
+
+                            <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                                <div className="lg:col-span-2 space-y-8">
+                                    {/* UBICAZIONE E PERSONALE */}
+                                    <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl">
+                                        <h2 className="text-blue-400 font-bold uppercase text-[10px] mb-8 tracking-widest flex items-center gap-2 border-b border-slate-700/50 pb-4 text-white"><Icon name="mapPin" size={16}/> Ubicazione e Personale Tecnico</h2>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                                            <div className="space-y-6">
+                                                <div className="h-48 bg-slate-900 rounded-[2rem] border-2 border-dashed border-slate-700 flex items-center justify-center relative overflow-hidden group">
+                                                    {currentProject.fotoCopertina ? <img src={currentProject.fotoCopertina} className="w-full h-full object-cover" /> : <div className="text-center opacity-30 text-slate-500"><Icon name="camera" size={32}/><p className="text-[10px] font-black mt-2">Copertina Cantiere</p></div>}
+                                                    <input type="file" accept="image/*" capture="environment" className="absolute inset-0 opacity-0 cursor-pointer" onChange={(e) => { const r = new FileReader(); r.onload = async () => { const res = await compressImage(r.result); updateCurrentProject({fotoCopertina: res}); }; if (e.target.files[0]) r.readAsDataURL(e.target.files[0]); }} />
+                                                </div>
+                                                <input type="text" placeholder="Indirizzo Cantiere..." value={currentProject.posizione?.indirizzo || ''} onChange={(e) => updateCurrentProject({posizione: {...currentProject.posizione, indirizzo: e.target.value}})} className="w-full bg-slate-900 p-4 rounded-2xl border border-slate-700 outline-none focus:ring-1 focus:ring-blue-500 text-white shadow-inner" />
+                                                <button onClick={getLocation} className="w-full bg-slate-700 p-4 rounded-2xl text-[10px] font-black uppercase flex items-center justify-center gap-2 hover:bg-slate-600 transition-all shadow-md text-white"><Icon name="mapPin" /> ACQUISISCI GPS</button>
+                                            </div>
+                                            <div className="rounded-[2rem] overflow-hidden border border-slate-700 h-full bg-slate-900 min-h-[250px] shadow-inner text-white">
+                                                {currentProject.posizione?.lat ? <iframe className="w-full h-full border-none" src={`https://maps.google.com/maps?q=${currentProject.posizione.lat},${currentProject.posizione.lng}&t=h&z=18&output=embed`}></iframe> : <div className="w-full h-full flex flex-col items-center justify-center text-slate-700 text-[10px] italic p-10 text-center font-black">GPS non acquisito</div>}
+                                            </div>
+                                        </div>
+                                        <div className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-6 border-t border-slate-700/50 pt-8 text-white">
+                                            {['dl', 'cse', 'do'].map(k => (
+                                                <div key={k} className="bg-slate-900 p-3 rounded-xl border border-slate-700 flex items-center">
+                                                    <span className="text-[8px] font-black text-slate-500 uppercase w-10">{k}</span>
+                                                    <input type="text" value={currentProject.ruoli[k] || ''} onChange={(e)=>updateCurrentProject({ruoli:{...currentProject.ruoli, [k]:e.target.value}})} className="flex-1 bg-transparent border-none p-0 text-sm font-bold uppercase focus:ring-0 text-white" placeholder="Nominativo" />
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* CRONOPROGRAMMA */}
+                                    <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl">
+                                        <div className="flex justify-between items-center mb-8 border-b border-slate-700/50 pb-4">
+                                            <h2 className="text-blue-400 font-bold uppercase text-[10px] tracking-widest flex items-center gap-2"><Icon name="table" size={16}/> Cronoprogramma Lavori (Importazione IA)</h2>
+                                            <div className="flex gap-3">
+                                                <label className="bg-indigo-600/20 text-indigo-400 px-4 py-2 rounded-xl font-bold text-[10px] uppercase border border-indigo-500/30 cursor-pointer hover:bg-indigo-600/30 transition-all flex items-center gap-2">
+                                                    <Icon name="fileUp" size={14}/> Carica PDF/Excel/Foto
+                                                    <input type="file" className="hidden" onChange={handleFileImport} />
+                                                </label>
+                                                <button onClick={()=>updateCurrentProject({cronoprogramma: [...(currentProject.cronoprogramma||[]), {id: Date.now().toString(), lavorazione: '', inizio: '', fine: ''}]})} className="bg-blue-600/20 text-blue-400 px-4 py-2 rounded-xl font-bold text-[10px] uppercase border border-blue-500/30">+ Voce</button>
+                                            </div>
+                                        </div>
+                                        <div className="overflow-x-auto custom-scrollbar">
+                                            <table className="w-full text-left border-collapse">
+                                                <thead>
+                                                    <tr className="text-[10px] uppercase font-black text-slate-500 border-b border-slate-700">
+                                                        <th className="p-3">Lavorazione</th>
+                                                        <th className="p-3 w-32 text-center">Inizio</th>
+                                                        <th className="p-3 w-32 text-center">Fine</th>
+                                                        <th className="p-3 w-10"></th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {(currentProject.cronoprogramma || []).map(t => (
+                                                        <tr key={t.id} className="border-b border-slate-700/50 group">
+                                                            <td className="p-0"><input type="text" value={t.lavorazione} onChange={(e)=>updateCurrentProject({cronoprogramma: currentProject.cronoprogramma.map(x=>x.id===t.id?{...x, lavorazione:e.target.value}:x)})} className="excel-input font-bold text-sm" placeholder="Voce lavori..." /></td>
+                                                            <td className="p-0"><input type="date" value={t.inizio} onChange={(e)=>updateCurrentProject({cronoprogramma: currentProject.cronoprogramma.map(x=>x.id===t.id?{...x, inizio:e.target.value}:x)})} className="excel-input text-xs text-center" /></td>
+                                                            <td className="p-0"><input type="date" value={t.fine} onChange={(e)=>updateCurrentProject({cronoprogramma: currentProject.cronoprogramma.map(x=>x.id===t.id?{...x, fine:e.target.value}:x)})} className="excel-input text-xs text-center" /></td>
+                                                            <td className="p-2"><button onClick={()=>updateCurrentProject({cronoprogramma: currentProject.cronoprogramma.filter(x=>x.id!==t.id)})} className="text-red-500 opacity-0 group-hover:opacity-100 p-2"><Icon name="trash2" size={14}/></button></td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                    
+                                    {/* DITTE E MANODOPERA */}
+                                    <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl">
+                                        <h2 className="text-blue-400 font-bold uppercase text-[10px] mb-8 tracking-widest flex items-center gap-2 border-b border-slate-700/50 pb-4"><Icon name="users" size={16}/> Imprese e Manodopera Presente</h2>
+                                        <div className="space-y-6">
+                                            <div className="bg-slate-900 p-6 rounded-[2rem] border border-slate-700 shadow-inner">
+                                                <label className="text-[10px] uppercase font-black text-slate-500 mb-4 block">Impresa Affidataria / Appaltatrice</label>
+                                                <div className="flex gap-4">
+                                                    <input type="text" value={currentProject.impresaAppaltatrice?.nome || ''} onChange={(e)=>updateCurrentProject({impresaAppaltatrice:{...currentProject.impresaAppaltatrice, nome: e.target.value}})} placeholder="Ragione Sociale" className="flex-1 bg-slate-800 p-3 rounded-xl border border-slate-700 text-sm outline-none focus:ring-1 focus:ring-blue-500 text-white" />
+                                                    <div className="w-32 bg-slate-800 p-3 rounded-xl border border-slate-700 flex flex-col items-center">
+                                                        <span className="text-[8px] font-black text-slate-500 uppercase mb-1">Operai</span>
+                                                        <input type="number" value={currentProject.impresaAppaltatrice?.operai || ''} onChange={(e)=>updateCurrentProject({impresaAppaltatrice:{...currentProject.impresaAppaltatrice, operai: e.target.value}})} className="bg-transparent border-none p-0 text-center font-black text-blue-400 focus:ring-0" />
+                                                    </div>
+                                                </div>
+                                            </div>
+                                            {(currentProject.impreseSub || []).map(s => (
+                                                <div key={s.id} className="flex gap-3 items-center bg-slate-900 p-3 rounded-xl border border-slate-700 shadow-inner">
+                                                    <input type="text" placeholder="Ditta Sub..." value={s.nome} onChange={(e)=>updateCurrentProject({impreseSub: currentProject.impreseSub.map(x=>x.id===s.id?{...x, nome:e.target.value}:x)})} className="flex-1 bg-transparent text-sm font-bold border-none focus:ring-0 text-white" />
+                                                    <input type="number" placeholder="Op." value={s.operai} onChange={(e)=>updateCurrentProject({impreseSub: currentProject.impreseSub.map(x=>x.id===s.id?{...x, operai:e.target.value}:x)})} className="w-16 bg-slate-800 p-2 rounded-lg text-center text-sm font-black" />
+                                                    <button onClick={()=>updateCurrentProject({impreseSub: currentProject.impreseSub.filter(x=>x.id!==s.id)})} className="text-red-500 p-2 hover:bg-red-500/10 rounded-lg"><Icon name="trash2" size={16}/></button>
+                                                </div>
+                                            ))}
+                                            <button onClick={()=>updateCurrentProject({impreseSub: [...(currentProject.impreseSub||[]), {id: Date.now().toString(), nome: '', operai: ''}]})} className="w-full border-2 border-dashed border-slate-700 p-3 rounded-xl text-[10px] font-black text-slate-500 hover:text-white transition-all uppercase">+ AGGIUNGI SUBAPPALTO</button>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div className="space-y-8">
+                                    <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl flex flex-col h-fit sticky top-4">
+                                        <div className="flex justify-between items-center mb-8 border-b border-slate-700/50 pb-4">
+                                            <h2 className="text-blue-400 font-bold uppercase text-[10px] flex items-center gap-2"><Icon name="calendar" size={16}/> Stato Tempi</h2>
+                                            <button onClick={handleAnalyzeAI} className="bg-amber-500/20 text-amber-400 px-3 py-1.5 rounded-xl text-[9px] font-black border border-amber-500/20 active:scale-95"><Icon name="sparkles" size={14}/> Analisi IA</button>
+                                        </div>
+                                        <div className="space-y-6">
+                                            {currentProject.dateCantiere?.fine && (
+                                                <div className={`p-4 rounded-2xl border text-center font-black text-[10px] uppercase tracking-widest ${getProjectTiming(currentProject).remaining >= 0 ? 'bg-indigo-500/10 border-indigo-500/20 text-indigo-400' : 'bg-red-500/10 border-red-500/20 text-red-400'}`}>
+                                                    {getProjectTiming(currentProject).remaining >= 0 ? `Ultimazione tra ${getProjectTiming(currentProject).remaining} GG` : `Scaduto da: ${Math.abs(getProjectTiming(currentProject).remaining)} GG`}
+                                                    {getProjectTiming(currentProject).suspended > 0 && <p className="mt-1 text-[8px] opacity-70 italic font-bold">Sospensioni totali: {getProjectTiming(currentProject).suspended} GG</p>}
+                                                </div>
+                                            )}
+                                            <div className="grid grid-cols-1 gap-4">
+                                               <div className="bg-slate-900 p-3 rounded-xl border border-slate-700"><label className="text-[9px] uppercase font-black text-slate-500 block mb-1">Data Consegna</label><input type="date" value={currentProject.dateCantiere.consegna || ''} onChange={(e)=>updateCurrentProject({dateCantiere: {...currentProject.dateCantiere, consegna: e.target.value}})} className="w-full bg-transparent p-0 text-md font-black outline-none focus:ring-0 text-white" /></div>
+                                               <div className="bg-slate-900 p-3 rounded-xl border border-slate-700"><label className="text-[9px] uppercase font-black text-slate-500 block mb-1">Data Fine Lavori</label><input type="date" value={currentProject.dateCantiere.fine || ''} onChange={(e)=>updateCurrentProject({dateCantiere: {...currentProject.dateCantiere, fine: e.target.value}})} className="w-full bg-transparent p-0 text-md font-black outline-none focus:ring-0 text-white" /></div>
+                                            </div>
+                                        </div>
+                                        <div className="mt-8 pt-8 border-t border-slate-700/50 space-y-4">
+                                            {['dl', 'cse'].map(k => (
+                                                <div key={k}>
+                                                    <label className="text-[8px] uppercase font-black text-slate-500 mb-1 ml-2 block uppercase">Note Stabili {k}</label>
+                                                    <textarea value={currentProject.note?.[k] || ''} onChange={(e)=>updateCurrentProject({note:{...currentProject.note,[k]:e.target.value}})} className="w-full bg-slate-900 p-3 rounded-xl border border-slate-700 text-xs h-20 outline-none focus:ring-1 focus:ring-blue-500 text-white" placeholder="Annotazioni stabili..." />
+                                                </div>
+                                            ))}
+                                        </div>
+                                        <div className="mt-8 border-t border-slate-700/50 pt-8 flex justify-between items-center">
+                                            <h2 className="text-sm font-black uppercase flex items-center gap-2"><Icon name="fileText" className="text-blue-500"/> Elenco Verbali</h2>
+                                            <button onClick={() => {
+                                                const newV = { id: Date.now().toString(), numero: (currentProject.verbali?.length || 0) + 1, dataEmissione: new Date().toISOString().split('T')[0], oraEmissione: new Date().toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' }), tipo: TIPI_VERBALE[0], presenze: [], elementi: [], documenti: [], prescrizioni: '', lavorazioneEffettiva: '' };
+                                                updateCurrentProject({verbali: [newV, ...(currentProject.verbali || [])]}); setCurrentReport(newV); setView('report');
+                                            }} className="bg-blue-600 p-2 rounded-xl active:scale-90 shadow-xl text-white">+ Nuovo</button>
+                                        </div>
+                                        <div className="space-y-3 mt-4 max-h-[300px] overflow-y-auto pr-1">
+                                            {(currentProject.verbali || []).map(v => (
+                                                <div key={v.id} onClick={() => { setCurrentReport(v); setView('report'); }} className="bg-slate-900 p-5 rounded-3xl flex justify-between items-center cursor-pointer hover:border-blue-500 border-2 border-transparent shadow-lg group">
+                                                    <div className="flex flex-col"><span className="text-[9px] font-black text-slate-500 uppercase">{v.numero}° - {v.tipo?.split(' ')[2] || 'Atto'}</span><span className="font-bold text-sm mt-1 text-slate-200">{formatDate(v.dataEmissione)}</span></div>
+                                                    <Icon name="chevronRight" className="text-slate-700 group-hover:text-blue-500" />
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* VISTA VERBALE (REPORT) */}
+                    {view === 'report' && currentReport && (
+                        <div className="p-4 max-w-4xl mx-auto pb-24 animate-fade-in text-white">
+                            <div className="flex justify-between items-center mb-10 gap-6">
+                                <button onClick={() => setView('project')} className="bg-slate-800 p-4 rounded-2xl shadow-xl hover:bg-slate-700 transition-all text-white"><Icon name="arrowLeft" /></button>
+                                <div className="flex-1 text-center">
+                                    <h2 className="text-2xl font-black uppercase tracking-tighter">Atto Sopralluogo N° {currentReport.numero}</h2>
+                                    <p className="text-[9px] font-bold text-slate-500 uppercase mt-2">{currentProject?.nomeLavoro}</p>
+                                </div>
+                                <div className="flex gap-3">
+                                    <button onClick={() => generatePDFAndSaveCloud()} className="bg-indigo-600 px-6 py-4 rounded-2xl font-black shadow-2xl flex gap-2 text-xs uppercase active:scale-95 transition-all text-white"><Icon name="cloud" size={16}/> Salva Cloud</button>
+                                    <button onClick={() => generatePDFAndSaveCloud()} className="bg-blue-600 px-8 py-4 rounded-2xl font-black shadow-2xl flex gap-3 text-xs uppercase active:scale-95 transition-all text-white"><Icon name="download" /> Esporta A3</button>
+                                </div>
+                            </div>
+                            
+                            <div className="space-y-10">
+                                <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl grid grid-cols-1 md:grid-cols-4 gap-8">
+                                    <div><label className="text-[10px] uppercase font-black text-slate-500 mb-2 block">Tipo Atto</label><select value={currentReport.tipo || TIPI_VERBALE[0]} className="w-full bg-slate-900 p-4 rounded-2xl border border-slate-700 font-bold text-xs text-white" onChange={(e)=>{ const updated = {...currentReport, tipo: e.target.value}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }}>{TIPI_VERBALE.map(t=><option key={t} value={t}>{t}</option>)}</select></div>
+                                    <div><label className="text-[10px] uppercase font-black text-slate-500 mb-2 block">Progressivo</label><input type="number" value={currentReport.numero} className="w-full bg-slate-900 p-4 rounded-2xl border border-slate-700 font-black text-blue-400 text-center" onChange={(e)=>{ const updated = {...currentReport, numero: e.target.value}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }} /></div>
+                                    <div><label className="text-[10px] uppercase font-black text-slate-500 mb-2 block">Data</label><input type="date" value={currentReport.dataEmissione} className="w-full bg-slate-900 p-4 rounded-2xl border border-slate-700 font-bold text-white" onChange={(e)=>{ const updated = {...currentReport, dataEmissione: e.target.value}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }} /></div>
+                                    <div><label className="text-[10px] uppercase font-black text-slate-500 mb-2 block">Ora Inizio</label><input type="time" value={currentReport.oraEmissione} className="w-full bg-slate-900 p-4 rounded-2xl border border-slate-700 font-bold text-white" onChange={(e)=>{ const updated = {...currentReport, oraEmissione: e.target.value}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }} /></div>
+                                </div>
+
+                                {/* RISCONTRO AVANZAMENTO */}
+                                <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl">
+                                    <div className="flex justify-between items-center mb-6">
+                                        <h3 className="font-black uppercase text-[10px] text-blue-400 tracking-widest flex items-center gap-2"><Icon name="sparkles" size={16}/> Riscontro Avanzamento Lavori</h3>
+                                        <button onClick={handleAnalyzeAI} className="bg-indigo-600/20 text-indigo-400 px-4 py-2 rounded-xl font-bold text-[9px] uppercase border border-indigo-500/30">Verifica IA</button>
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                        <div className="bg-slate-900/50 p-6 rounded-[2rem] border border-slate-700 shadow-inner">
+                                            <h4 className="text-[9px] font-black uppercase text-slate-500 mb-2">Pianificato da Excel</h4>
+                                            <p className="text-sm font-bold italic text-slate-300">
+                                                {(currentProject?.cronoprogramma || []).find(t => currentReport?.dataEmissione >= t.inizio && currentReport?.dataEmissione <= t.fine)?.lavorazione || "N.D."}
+                                            </p>
+                                        </div>
+                                        <div className="bg-blue-600/5 p-6 rounded-[2rem] border border-blue-500/20 shadow-inner">
+                                            <h4 className="text-[9px] font-black uppercase text-blue-400 mb-2">Riscontrato in loco</h4>
+                                            <input type="text" value={currentReport?.lavorazioneEffettiva || ''} onChange={(e)=>{ const updated = {...currentReport, lavorazioneEffettiva: e.target.value}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }} placeholder="Cosa è in corso?" className="bg-transparent border-none p-0 w-full font-bold text-sm focus:ring-0 text-white" />
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* SOGGETTI INTERVENUTI */}
+                                <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl">
+                                    <div className="flex justify-between items-center mb-8 border-b border-slate-700/50 pb-4">
+                                        <h3 className="font-black uppercase text-[10px] text-slate-500 flex items-center gap-2"><Icon name="users" /> Soggetti Intervenuti e Firme</h3>
+                                        <button onClick={() => {
+                                            const updated = { ...currentReport, presenze: [...(currentReport.presenze||[]), { id: Date.now().toString(), ruolo: RUOLI_INTERVENUTI[0], nome: '', firma: null }] };
+                                            setCurrentReport(updated); updateCurrentProject({ verbali: currentProject.verbali.map(x => x.id === updated.id ? updated : x) });
+                                        }} className="bg-blue-600/20 text-blue-400 px-4 py-2 rounded-xl font-bold text-[9px] uppercase border border-blue-500/20">+ Aggiungi</button>
+                                    </div>
+                                    <div className="space-y-4">
+                                        {(currentReport.presenze || []).map(p => (
+                                            <div key={p.id} className="bg-slate-900 p-6 rounded-[2.5rem] flex flex-col md:flex-row gap-6 items-center border border-slate-700 relative text-white">
+                                                <button onClick={()=>{ const updated = {...currentReport, presenze: currentReport.presenze.filter(x=>x.id!==p.id)}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }} className="absolute -top-2 -right-2 bg-red-600 p-2 rounded-xl shadow-lg text-white"><Icon name="trash2" size={14}/></button>
+                                                <div className="w-full md:w-1/3 space-y-4">
+                                                    <select value={p.ruolo} onChange={(e)=>{ const updated = {...currentReport, presenze: currentReport.presenze.map(x=>x.id===p.id?{...x, ruolo:e.target.value}:x)}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }} className="w-full bg-slate-800 p-3 rounded-xl text-xs font-bold border border-slate-700 text-white">{RUOLI_INTERVENUTI.map(r=><option key={r} value={r}>{r}</option>)}</select>
+                                                    <input type="text" placeholder="Nominativo..." value={p.nome || ''} className="w-full bg-slate-800 p-3 rounded-xl text-sm font-bold border border-slate-700 focus:ring-1 focus:ring-blue-500 text-white" onChange={(e) => {
+                                                        const updated = { ...currentReport, presenze: currentReport.presenze.map(x => x.id === p.id ? { ...x, name: e.target.value, nome: e.target.value } : x) };
+                                                        setCurrentReport(updated); updateCurrentProject({ verbali: currentProject.verbali.map(x => x.id === updated.id ? updated : x) });
+                                                    }} />
+                                                </div>
+                                                <div onClick={() => setSigningId(p.id)} className="w-full md:flex-1 h-24 bg-white rounded-3xl flex items-center justify-center cursor-pointer border-4 border-slate-700 overflow-hidden text-black">
+                                                    {p.firma ? <img src={p.firma} className="h-full object-contain p-2" /> : <div className="flex flex-col items-center opacity-40 text-slate-800"><Icon name="penTool" size={24}/><span className="text-[10px] font-black uppercase mt-1 text-black">Firma Digitale</span></div>}
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* RILIEVI FOTOGRAFICI */}
+                                <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl">
+                                    <div className="flex justify-between items-center mb-8 border-b border-slate-700/50 pb-4 text-white">
+                                        <h3 className="font-black uppercase text-[10px] text-slate-500 flex items-center gap-2"><Icon name="camera" /> Rilievi Fotografici e Note</h3>
+                                        <button onClick={() => {
+                                            const codeNum = (currentReport.elementi?.length || 0) + 1;
+                                            const updated = {...currentReport, elementi: [...(currentReport.elementi||[]), { id: Date.now().toString(), codice: `EL-${codeNum}`, foto: null, note: '', categoria: CATEGORIE_ANTINCENDIO[0] }] };
+                                            setCurrentReport(updated); updateCurrentProject({ verbali: currentProject.verbali.map(x => x.id === updated.id ? updated : x) });
+                                        }} className="bg-green-600/20 text-green-400 px-4 py-2 rounded-xl font-bold text-[9px] uppercase border border-green-500/20">+ Nuovo Rilievo</button>
+                                    </div>
+                                    <div className="space-y-8">
+                                        {(currentReport.elementi || []).map(el => (
+                                            <div key={el.id} className="bg-slate-900 p-6 rounded-[2.5rem] flex flex-col md:flex-row gap-8 relative border border-slate-700 shadow-inner">
+                                                <button onClick={() => { const updated = {...currentReport, elementi: currentReport.elementi.filter(x=>x.id!==el.id)}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }} className="absolute -top-4 -right-4 bg-red-600 p-2 rounded-xl shadow-lg text-white"><Icon name="trash2" size={16}/></button>
+                                                <div className="w-full md:w-56 h-48 bg-slate-950 rounded-3xl flex items-center justify-center relative overflow-hidden border-2 border-dashed border-slate-800 text-white">
+                                                    {el.foto ? <img src={el.foto} className="w-full h-full object-cover" /> : <div className="text-center opacity-30 text-slate-500"><Icon name="camera" size={32}/><p className="text-[9px] font-black uppercase mt-1">Scatta</p></div>}
+                                                    <input type="file" accept="image/*" capture="environment" className="absolute inset-0 opacity-0 cursor-pointer text-white" onChange={(e) => { const r = new FileReader(); r.onload = async () => { const res = await compressImage(r.result); const updated = {...currentReport, elementi: currentReport.elementi.map(x=>x.id===el.id?{...x, foto:res}:x)}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }; if (e.target.files[0]) r.readAsDataURL(e.target.files[0]); }} />
+                                                </div>
+                                                <div className="flex-1 space-y-5 text-white">
+                                                    <div className="flex gap-4">
+                                                        <div className="w-24"><label className="text-[8px] uppercase font-black text-slate-500 mb-1 ml-1 block">Codice</label><input type="text" value={el.codice || ''} className="w-full bg-slate-800 p-3 rounded-xl text-xs font-black text-blue-400 text-center border border-slate-700" onChange={(e)=>{ const updated = {...currentReport, elementi: currentReport.elementi.map(x=>x.id===el.id?{...x, codice:e.target.value.toUpperCase()}:x)}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }}/></div>
+                                                        <div className="flex-1"><label className="text-[8px] uppercase font-black text-slate-500 ml-1 mb-1 block">Categoria</label><select value={el.categoria || CATEGORIE_ANTINCENDIO[0]} className="w-full bg-slate-800 p-3 rounded-xl text-xs font-bold border border-slate-700 text-white" onChange={(e)=>{ const updated = {...currentReport, elementi: currentReport.elementi.map(x=>x.id===el.id?{...x, categoria:e.target.value}:x)}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }}>{CATEGORIE_ANTINCENDIO.map(c=><option key={c} value={c}>{c}</option>)}</select></div>
+                                                    </div>
+                                                    <textarea placeholder="Descrizione tecnica..." className="w-full bg-slate-800 p-4 rounded-2xl border border-slate-700 text-sm h-32 outline-none focus:ring-1 focus:ring-blue-500 text-white" value={el.note} onChange={(e)=>{ const updated = {...currentReport, elementi: currentReport.elementi.map(x=>x.id===el.id?{...x, note:e.target.value}:x)}; setCurrentReport(updated); updateCurrentProject({verbali: currentProject.verbali.map(x=>x.id===updated.id?updated:x)}); }} />
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* PRESCRIZIONI FORMALI */}
+                                <div className="bg-slate-800 p-8 rounded-[3rem] border border-slate-700 shadow-2xl text-white">
+                                    <h3 className="font-black uppercase text-[10px] text-orange-400 mb-6 flex items-center gap-2"><Icon name="alertTriangle" /> Prescrizioni Formali alle Imprese</h3>
+                                    <textarea value={currentReport.prescrizioni} className="w-full bg-slate-900 p-6 rounded-[2rem] border border-slate-700 h-40 shadow-inner text-sm leading-relaxed focus:ring-1 focus:ring-orange-500 outline-none text-white" placeholder="Annotare ordini o prescrizioni impartite in data odierna..." onChange={(e) => { const updated = { ...currentReport, prescrizioni: e.target.value }; setCurrentReport(updated); updateCurrentProject({ verbali: currentProject.verbali.map(x => x.id === updated.id ? updated : x) }); }} />
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* PDF HIDDEN CONTENT (A3) */}
+                    <div style={{ display: isGeneratingPDF ? 'block' : 'none', position: 'fixed', top: 0, left: 0, width: '800px', zIndex: -100, backgroundColor: 'white' }}>
+                        <div id="pdf-content" className="px-12 pt-10 pb-6 text-black bg-white" style={{ width: '800px', margin: 0, textAlign: 'left', fontFamily: "'Calibri', 'Carlito', 'Roboto', sans-serif" }}>
+                            <div className="flex flex-col items-center border-b-2 border-black pb-4 mb-8 text-center text-black">
+                                <img src={customLogo || defaultLogo} className="h-16 mb-2 object-contain" onError={handleImageError} />
+                                <h1 className="text-xl font-bold uppercase tracking-widest leading-none">Città Metropolitana di Genova</h1>
+                                <h2 className="text-md font-semibold text-slate-700 mt-1 uppercase tracking-tighter text-black">Direzione Scuole Edilizia e Patrimonio</h2>
+                            </div>
+                            
+                            <div className="flex justify-center items-center gap-4 mb-4">
+                                <div style={{width: '24px', height: '24px', borderRadius: '50%', backgroundColor: STATI_COMMESSA_LIST[currentProject?.stato || 'attiva']?.hex || '#ccc', border: '1px solid black'}}></div>
+                                <h3 className="text-xl font-bold uppercase underline underline-offset-4 text-black">Verbale di Sopralluogo Cantiere N° {currentReport?.numero}</h3>
+                            </div>
+                            
+                            <div className="text-center mb-8 text-black">
+                                <p className="text-md font-black text-blue-900 uppercase tracking-widest leading-none">{currentReport?.tipo || "Atto di Sopralluogo"}</p>
+                                <p className="text-sm font-bold text-slate-700 uppercase mt-2">Del {formatDate(currentReport?.dataEmissione)} - Ore {currentReport?.oraEmissione || '--:--'}</p>
+                            </div>
+
+                            <div className="border-2 border-black p-6 rounded-xl space-y-2 mb-8 text-[12px] shadow-sm text-black">
+                                <p className="uppercase text-black"><strong>Lavoro:</strong> {currentProject?.nomeLavoro}</p>
+                                <p><strong>Ubicazione:</strong> {currentProject?.posizione?.indirizzo || '-'}</p>
+                                <p className="border-t border-slate-100 pt-1 mt-1 font-bold text-blue-900">Tecnici di Riferimento:</p>
+                                <p><strong>D.L.:</strong> {currentProject?.ruoli?.dl || "-"} | <strong>C.S.E.:</strong> {currentProject?.ruoli?.cse || "-"} | <strong>D.O.:</strong> {currentProject?.ruoli?.do || "-"}</p>
+                                <p className="border-t border-slate-100 pt-1 mt-1 font-bold text-blue-900">Personale Presente:</p>
+                                <p><strong>Affidataria:</strong> {currentProject?.impresaAppaltatrice?.nome || '-'} ({currentProject?.impresaAppaltatrice?.operai || 0} op.)</p>
+                                {(currentProject?.impreseSub || []).length > 0 && <p><strong>Subappalti:</strong> {currentProject?.impreseSub.map(s => `${s.nome} (${s.operai} op.)`).join(', ')}</p>}
+                            </div>
+
+                            {/* --- CRONOPROGRAMMA SOTTO UBICAZIONE NEL PDF --- */}
+                            <div className="border-2 border-black p-6 rounded-xl mb-8 text-[12px] bg-slate-50/50 shadow-sm text-black">
+                                <h4 className="font-bold uppercase text-[9px] text-blue-900 mb-3 tracking-widest border-b border-slate-300 pb-1">Cronoprogramma e Stato Avanzamento</h4>
+                                <div className="grid grid-cols-2 gap-x-8 gap-y-2">
+                                    <p><strong>Giorni Sospensione Totali:</strong> {getProjectTiming(currentProject).suspended} GG</p>
+                                    <p><strong>Ultimazione (Ricalcolata):</strong> {formatDate(getProjectTiming(currentProject).adjustedDeadline)}</p>
+                                    <p className="col-span-2 mt-2"><strong>Pianificato da Excel:</strong> {(currentProject?.cronoprogramma || []).find(t => currentReport?.dataEmissione >= t.inizio && currentReport?.dataEmissione <= t.fine)?.lavorazione || "N.D."}</p>
+                                    <p className="col-span-2 text-blue-800 font-bold"><strong>Riscontrato in loco:</strong> {currentReport?.lavorazioneEffettiva || "Non dichiarato"}</p>
+                                </div>
+                            </div>
+
+                            {/* FOTO E MAPPA SATELLITARE NEL PDF */}
+                            <div className="grid grid-cols-2 gap-4 mb-8 avoid-break text-black">
+                                <div className="border-2 border-black rounded-xl overflow-hidden h-48 bg-slate-50 flex items-center justify-center">
+                                   {currentProject?.fotoCopertina ? <img src={currentProject.fotoCopertina} className="w-full h-full object-cover" /> : <p className="text-[9px] uppercase font-black text-slate-400">Nessuna foto copertina</p>}
+                                </div>
+                                <div className="border-2 border-black rounded-xl overflow-hidden h-48 bg-slate-50 flex items-center justify-center">
+                                   {currentProject?.posizione?.lat ? (
+                                       <img 
+                                          src={`https://maps.googleapis.com/maps/api/staticmap?center=${currentProject.posizione.lat},${currentProject.posizione.lng}&zoom=18&size=400x240&maptype=hybrid&markers=color:red%7C${currentProject.posizione.lat},${currentProject.posizione.lng}&key=`} 
+                                          className="w-full h-full object-cover" 
+                                          crossOrigin="anonymous"
+                                          alt="Mappa Cantiere" 
+                                       />
+                                   ) : <p className="text-[9px] uppercase font-black text-slate-400 text-center px-4">Planimetria non disponibile</p>}
+                                </div>
+                            </div>
+
+                            <div className="mb-8 border-2 border-black p-5 rounded-xl text-[12px] text-black">
+                                <h4 className="font-bold uppercase mb-3 bg-slate-50 py-1 px-2 border-y border-slate-200">Soggetti Intervenuti</h4>
+                                <ul className="list-disc pl-8 space-y-1">
+                                    {currentReport?.presenze?.map(p => <li key={p.id}><strong>{p.ruolo}:</strong> {p.nome || "________________"}</li>)}
+                                </ul>
+                            </div>
+
+                            <div className="space-y-6 text-black">
+                                <h4 className="font-bold text-[12px] uppercase bg-slate-50 py-1 px-2 border-y border-slate-200 mb-4">Rilievi Fotografici e Note Tecniche</h4>
+                                {currentReport?.elementi?.map(el => (
+                                    <div key={el.id} className="flex gap-5 border border-slate-100 p-3 rounded-lg avoid-break bg-slate-50/20">
+                                        <div className="w-48 h-36 bg-white rounded-xl overflow-hidden border border-slate-200 shadow-sm flex-shrink-0"><img src={el.foto} className="w-full h-full object-cover" /></div>
+                                        <div className="flex-1 min-w-0">
+                                            <div className="flex justify-between border-b border-slate-200 pb-1 mb-2 items-center"><p className="font-bold uppercase text-[9px] text-blue-700">{el.categoria}</p><p className="font-mono text-[9px] font-black bg-slate-100 px-2 py-0.5 rounded border border-slate-200">COD: {el.codice}</p></div>
+                                            <p className="text-[11px] italic leading-tight text-slate-800 whitespace-pre-wrap">{el.note || 'N.D.'}</p>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+
+                            <div className="mt-8 border-2 border-black p-5 rounded-xl avoid-break text-black">
+                                <h4 className="font-bold text-[12px] uppercase bg-slate-50 py-1 px-2 border-y border-slate-200 mb-4">Note di Progetto e Prescrizioni Formali</h4>
+                                <div className="text-[11px] space-y-2 mb-6">
+                                    <p><strong>Note Direzione Lavori:</strong> {currentProject?.note?.dl || "Nessuna annotazione."}</p>
+                                    <p><strong>Note Coordinatore Sicurezza:</strong> {currentProject?.note?.cse || "Nessuna annotazione."}</p>
+                                </div>
+                                <div className="pt-3 border-t border-slate-200">
+                                    <h5 className="font-black text-[9px] uppercase text-slate-500 mb-2 tracking-widest">Prescrizioni alle Imprese</h5>
+                                    <p className="text-[11px] italic font-semibold">{currentReport?.prescrizioni || "Nessuna prescrizione impartita."}</p>
+                                </div>
+                            </div>
+
+                            <div className="mt-12 block avoid-break text-black">
+                                <h4 className="font-bold text-[11px] uppercase mb-8 text-center border-y border-slate-200 py-2">Firme dei Sottoscrittori</h4>
+                                <div className="flex flex-wrap justify-center gap-x-10 gap-y-16 pt-4 text-black">
+                                    {currentReport?.presenze?.filter(p=>p.firma).map(p => (
+                                        <div key={p.id} className="text-center w-48 border-b border-slate-200 pb-2 avoid-break">
+                                            <div className="h-16 flex items-center justify-center mb-2"><img src={p.firma} className="max-h-full max-w-full object-contain" alt="Firma" /></div>
+                                            <p className="text-[10px] font-black uppercase leading-none">{p.nome || "________________"}</p><p className="text-[8px] font-bold text-slate-500 uppercase mt-1 tracking-tighter">{p.ruolo}</p>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="mt-10 pt-4 border-t border-slate-300 text-center text-black">
+                                <p className="text-[7px] text-slate-500 uppercase">Città Metropolitana di Genova - CF: 80007350103 | P.Iva: 00949170104 | Piazzale Mazzini 2, 16122 Genova</p>
+                                <p className="text-[7px] text-slate-500 uppercase mt-1">Centralino 010 54991 Fax 010 5499244 URP 010 5499456 Num.Verde 800 509420 | P.E.C.: pec@cert.cittametropolitana.genova.it</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* MODALI */}
+                    {showAI && (
+                        <div className="fixed inset-0 bg-black/95 z-[200] flex items-center justify-center p-4 backdrop-blur-md animate-fade-in text-white">
+                           <div className="bg-slate-800 p-8 rounded-[3rem] w-full max-w-2xl border border-slate-700 shadow-2xl relative flex flex-col max-h-[90vh]">
+                              <button onClick={() => setShowAI(false)} className="absolute top-8 right-8 text-slate-500 hover:text-white transition-colors"><Icon name="x" size={28}/></button>
+                              <h3 className="text-2xl font-black text-white flex items-center gap-3 mb-6 uppercase tracking-tighter"><Icon name="sparkles" className="text-amber-400" size={32}/> Assistente AI Cronoprogramma</h3>
+                              <div className="overflow-y-auto custom-scrollbar flex-1 pr-2">{aiLoading ? (<div className="flex flex-col items-center justify-center py-16"><Icon name="sparkles" className="text-amber-400 animate-spin mb-4" size={48} /><p className="text-slate-300 font-bold uppercase tracking-widest text-xs animate-pulse">Analisi in corso...</p></div>) : (<div className="text-slate-200 text-sm leading-relaxed whitespace-pre-wrap bg-slate-900/50 p-6 rounded-3xl border border-slate-700 shadow-inner">{aiResult}</div>)}</div>
+                           </div>
+                        </div>
+                    )}
+
+                    {signingId && (
+                        <div className="fixed inset-0 bg-black/95 z-[100] flex items-center justify-center p-6 backdrop-blur-xl text-white">
+                            <div className="bg-slate-800 p-8 rounded-[3rem] w-full max-w-xl border border-slate-700 shadow-2xl relative">
+                                <button onClick={()=>setSigningId(null)} className="absolute top-6 right-6 text-slate-500 hover:text-white transition-colors"><Icon name="x" size={32}/></button>
+                                <h3 className="text-xl font-black uppercase text-white mb-8 tracking-tighter text-center">Firma Digitale</h3>
+                                <SignaturePad onCancel={()=>setSigningId(null)} onSave={(data)=>{
+                                    const updated = {...currentReport, presenze: currentReport.presenze.map(p=>p.id===signingId?{...p, firma:data}:p)};
+                                    setCurrentReport(updated);
+                                    const updatedList = projects.map(p => p.id === currentProject.id ? { ...currentProject, verbali: currentProject.verbali.map(x => x.id === updated.id ? updated : x) } : p);
+                                    syncWithDatabase(updatedList);
+                                    setSigningId(null);
+                                }} />
+                            </div>
+                        </div>
+                    )}
+
+                    {isGeneratingPDF && (
+                        <div className="fixed inset-0 bg-slate-900/98 z-[9999] flex flex-col items-center justify-center text-white backdrop-blur-2xl">
+                            <Icon name="sparkles" className="animate-spin text-blue-500 mb-6" size={64} />
+                            <p className="font-black text-2xl uppercase tracking-[0.3em] animate-pulse text-center px-10">Generazione PDF A3 High-Res...</p>
+                        </div>
+                    )}
+
+                    {saveMessage && (
+                        <div className="fixed bottom-10 left-1/2 -translate-x-1/2 bg-blue-600 text-white px-10 py-5 rounded-[2.5rem] font-black shadow-2xl animate-in slide-in-from-bottom-10 uppercase text-[10px] tracking-[0.2em] border-2 border-white/20 z-[100]">
+                            <span className="flex items-center gap-3"><Icon name="save" size={18}/> {saveMessage}</span>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
